@@ -1,0 +1,13 @@
+##ignore this file##
+.idea
+.idea/
+*.zip
+bin/
+public/
+logs
+logs/
+*.exe
+.vscode/
+tmp/
+.streamlit/secrets.toml
+*.db

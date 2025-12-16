@@ -1,0 +1,12 @@
+[project]
+name = "bbg-vote"
+version = "0.1.0"
+description = "A board game voting app using BoardGameGeek data"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.29.0",
+    "requests>=2.31.0",
+    "xmltodict>=0.13.0",
+    "deep-translator>=1.11.4",
+]
