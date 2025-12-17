@@ -4,40 +4,51 @@ import pandas as pd
 import requests
 import xml.etree.ElementTree as ET
 import time
-import base64
-import os
 import re
 from html import unescape
 from deep_translator import GoogleTranslator
 
 # ==========================================
-# 1. 数据库与逻辑层
+# 1. 数据库层 (架构重构：游戏库 + 关联)
 # ==========================================
-DB_FILE = "bgg_votes.db"
+DB_FILE = "bgg_votes_v2.db" # 建议换个文件名以防冲突
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
+    # 1. 游戏库 (一次录入，永久保存)
+    c.execute('''CREATE TABLE IF NOT EXISTS library (
+                                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                        bgg_id TEXT UNIQUE,
+                                                        name TEXT,
+                                                        year TEXT,
+                                                        thumbnail TEXT,
+                                                        description TEXT,
+                                                        rating REAL,
+                                                        rank TEXT,
+                                                        weight REAL,
+                                                        min_players INTEGER,
+                                                        max_players INTEGER
+                 )''')
+
+    # 2. 投票房间
     c.execute('''CREATE TABLE IF NOT EXISTS polls (
                                                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                       title TEXT NOT NULL,
                                                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                  )''')
 
-    # 扩展 candidates 表，增加 description, rating, bgg_rank
-    c.execute('''CREATE TABLE IF NOT EXISTS candidates (
-                                                           id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                           poll_id INTEGER,
-                                                           bgg_id TEXT,
-                                                           name TEXT,
-                                                           year TEXT,
-                                                           thumbnail TEXT,
-                                                           description TEXT,
-                                                           rating REAL,
-                                                           bgg_rank TEXT,
-                                                           FOREIGN KEY(poll_id) REFERENCES polls(id)
+    # 3. 房间-游戏关联表 (投票候选项)
+    c.execute('''CREATE TABLE IF NOT EXISTS poll_candidates (
+                                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                poll_id INTEGER,
+                                                                library_id INTEGER,
+                                                                FOREIGN KEY(poll_id) REFERENCES polls(id),
+                                                                FOREIGN KEY(library_id) REFERENCES library(id)
                  )''')
 
+    # 4. 投票记录
     c.execute('''CREATE TABLE IF NOT EXISTS votes (
                                                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                       poll_id INTEGER,
@@ -49,16 +60,63 @@ def init_db():
     conn.commit()
     conn.close()
 
-def create_poll(title):
+# --- 数据库操作函数 ---
+
+def get_library_df():
+    """获取所有库内游戏，用于 DataFrame 展示"""
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM library ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+def add_game_to_library(game_data):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT INTO polls (title) VALUES (?)", (title,))
+    try:
+        c.execute('''INSERT OR IGNORE INTO library
+                     (bgg_id, name, year, thumbnail, description, rating, rank, weight, min_players, max_players)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (game_data['id'], game_data['name'], game_data['year'],
+                   game_data['thumbnail'], game_data['description'], game_data['rating'],
+                   game_data['rank'], game_data['weight'], game_data['min_players'], game_data['max_players']))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(e)
+        return False
+    finally:
+        conn.close()
+
+def delete_from_library(lib_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # 级联删除：如果游戏库删了，相关的投票候选项也要删
+    c.execute("DELETE FROM poll_candidates WHERE library_id = ?", (lib_id,))
+    c.execute("DELETE FROM library WHERE id = ?", (lib_id,))
     conn.commit()
     conn.close()
 
+def create_poll_with_games(title, library_ids):
+    """创建一个新投票并批量加入游戏"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO polls (title) VALUES (?)", (title,))
+        poll_id = c.lastrowid
+
+        # 批量插入关联
+        data = [(poll_id, lib_id) for lib_id in library_ids]
+        c.executemany("INSERT INTO poll_candidates (poll_id, library_id) VALUES (?, ?)", data)
+        conn.commit()
+        return True
+    except Exception as e:
+        print(e)
+        return False
+    finally:
+        conn.close()
+
 def get_polls():
     conn = sqlite3.connect(DB_FILE)
-    # 按照创建时间倒序
     df = pd.read_sql_query("SELECT * FROM polls ORDER BY created_at DESC", conn)
     conn.close()
     return df
@@ -67,29 +125,8 @@ def delete_poll(poll_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM votes WHERE poll_id = ?", (poll_id,))
-    c.execute("DELETE FROM candidates WHERE poll_id = ?", (poll_id,))
+    c.execute("DELETE FROM poll_candidates WHERE poll_id = ?", (poll_id,))
     c.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
-    conn.commit()
-    conn.close()
-
-def add_candidate_to_db(poll_id, game_data):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id FROM candidates WHERE poll_id=? AND bgg_id=?", (poll_id, game_data['id']))
-    if not c.fetchone():
-        c.execute('''INSERT INTO candidates
-                         (poll_id, bgg_id, name, year, thumbnail, description, rating, bgg_rank)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (poll_id, game_data['id'], game_data['name'], game_data['year'],
-                   game_data['thumbnail'], game_data['description'], game_data['rating'], game_data['rank']))
-        conn.commit()
-    conn.close()
-
-def delete_candidate(candidate_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM votes WHERE candidate_id = ?", (candidate_id,))
-    c.execute("DELETE FROM candidates WHERE id = ?", (candidate_id,))
     conn.commit()
     conn.close()
 
@@ -107,18 +144,37 @@ def cast_vote(poll_id, candidate_id, nick):
     return success
 
 def get_poll_results(poll_id):
+    """
+    复杂的联表查询：
+    投票 -> 候选项 -> 游戏库
+    """
     conn = sqlite3.connect(DB_FILE)
-    candidates_df = pd.read_sql_query("SELECT * FROM candidates WHERE poll_id = ?", conn, params=(poll_id,))
-    votes_df = pd.read_sql_query("SELECT candidate_id, COUNT(*) as count FROM votes WHERE poll_id = ? GROUP BY candidate_id", conn, params=(poll_id,))
-    voters_df = pd.read_sql_query("SELECT candidate_id, voter_nick FROM votes WHERE poll_id = ?", conn, params=(poll_id,))
+
+    query = '''
+            SELECT
+                pc.id as candidate_id,
+                l.name, l.year, l.thumbnail, l.description, l.rating, l.rank,
+                l.weight, l.min_players, l.max_players,
+                COUNT(v.id) as count
+            FROM poll_candidates pc
+                     JOIN library l ON pc.library_id = l.id
+                     LEFT JOIN votes v ON pc.id = v.candidate_id
+            WHERE pc.poll_id = ?
+            GROUP BY pc.id \
+            '''
+    df = pd.read_sql_query(query, conn, params=(poll_id,))
+
+    # 获取详细投票人列表
+    voters_query = "SELECT candidate_id, voter_nick FROM votes WHERE poll_id = ?"
+    voters_df = pd.read_sql_query(voters_query, conn, params=(poll_id,))
+
     conn.close()
 
-    if candidates_df.empty: return []
+    if df.empty: return []
 
-    merged = pd.merge(candidates_df, votes_df, left_on='id', right_on='candidate_id', how='left')
-    merged['count'] = merged['count'].fillna(0).astype(int)
-    results = merged.to_dict('records')
+    results = df.to_dict('records')
 
+    # 映射投票人
     voter_map = {}
     for _, row in voters_df.iterrows():
         cid = row['candidate_id']
@@ -126,182 +182,132 @@ def get_poll_results(poll_id):
         voter_map[cid].add(row['voter_nick'])
 
     for r in results:
-        r['voters'] = voter_map.get(r['id'], set())
+        r['voters'] = voter_map.get(r['candidate_id'], set())
 
     results.sort(key=lambda x: x['count'], reverse=True)
     return results
 
+# ==========================================
+# 2. API 层 (增加人数、重度解析，支持 Secrets)
+# ==========================================
 
-# ==========================================
-# 2. API 服务 (中文适配版)
-# ==========================================
 def contains_chinese(text):
-    """检查字符串是否包含中文字符"""
     if not text: return False
     return bool(re.search(r'[\u4e00-\u9fff]', text))
-
-def translate_text(text, target='zh-CN'):
-    """调用 Google 翻译"""
-    if not text: return ""
-    try:
-        # 限制长度以加快速度并防止报错，通常前500个字符足够了解游戏
-        text_to_translate = text[:800]
-        return GoogleTranslator(source='auto', target=target).translate(text_to_translate)
-    except Exception as e:
-        print(f"Translation failed: {e}")
-        return text # 如果翻译失败，回退到原文
 
 def fetch_bgg_api(query):
     search_url = "https://boardgamegeek.com/xmlapi2/search"
     thing_url = "https://boardgamegeek.com/xmlapi2/thing"
 
+    # Secrets 读取
     try:
-        # 读取 toml 中 [bgg] 下的 api_token
-        # 注意：如果本地没有 secrets.toml 文件或云端未配置，这里会报错
         token = st.secrets["bgg"]["api_token"]
-    except Exception:
-        #以此防止如果没有配置key导致程序崩坏，给予提示或设为空
+        headers = {"Authorization": f"Bearer {token}"}
+    except:
         token = ""
-        print("Warning: BGG Token not found in secrets.")
-
-    headers = {
-        "User-Agent": "GameNightVoter/1.1 (Personal Project)",
-        "Authorization": f"Bearer {token}"
-    }
+        headers = {}
+    headers["User-Agent"] = "GameLibraryManager/2.0"
 
     try:
         # Step 1: Search
-        # BGG 支持中文搜索（例如搜“卡坦岛”能搜到），但返回的列表通常还是以英文为主
         params_search = {"query": query, "type": "boardgame"}
         r_search = requests.get(search_url, params=params_search, headers=headers, timeout=10)
-
         if r_search.status_code != 200: return []
-        root_search = ET.fromstring(r_search.content)
-        items = root_search.findall("item")
+        items = ET.fromstring(r_search.content).findall("item")
         if not items: return []
 
-        # 提取前 8 个 ID (翻译比较慢，减少数量以提升体验)
         ids = [item.get("id") for item in items[:8]]
         if not ids: return []
 
-        # Step 2: Batch Get Details
-        ids_str = ",".join(ids)
-        params_thing = {"id": ids_str, "stats": "1"}
+        # Step 2: Get Details (stats=1)
+        params_thing = {"id": ",".join(ids), "stats": "1"}
         r_thing = requests.get(thing_url, params=params_thing, headers=headers, timeout=10)
-
-        if r_thing.status_code != 200: return []
         root_thing = ET.fromstring(r_thing.content)
 
         results = []
-
-        # 实例化翻译器（复用对象稍微快一点）
         translator = GoogleTranslator(source='auto', target='zh-CN')
 
         for item in root_thing.findall("item"):
             try:
                 g_id = item.get("id")
 
-                # --- 1. 处理名称 (优先找官方中文名) ---
-                primary_name = "Unknown"
-                chinese_name = None
+                # 名称处理 (优先中文)
+                primary = "Unknown"
+                cn_name = None
+                for n in item.findall("name"):
+                    if n.get("type") == "primary": primary = n.get("value")
+                    if contains_chinese(n.get("value")): cn_name = n.get("value")
 
-                # 遍历所有 name 标签
-                for name_node in item.findall("name"):
-                    if name_node.get("type") == "primary":
-                        primary_name = name_node.get("value")
+                display_name = cn_name if cn_name else translator.translate(primary)
 
-                    # 检查是否包含中文
-                    val = name_node.get("value")
-                    if contains_chinese(val):
-                        chinese_name = val # 找到了官方录入的中文名
+                # 基础信息
+                thumb = item.find("thumbnail")
+                thumbnail = thumb.text if thumb is not None else ""
+                year = item.find("yearpublished").get("value") if item.find("yearpublished") is not None else ""
 
-                # 决策：如果有官方中文名用官方的，没有则机器翻译 Primary Name
-                if chinese_name:
-                    display_name = chinese_name
-                else:
-                    # 只有当名字是英文时才去翻译，避免重复翻译
-                    display_name = translator.translate(primary_name)
+                # === 新增：人数 ===
+                min_p = item.find("minplayers").get("value") if item.find("minplayers") is not None else 0
+                max_p = item.find("maxplayers").get("value") if item.find("maxplayers") is not None else 0
 
-                # 为了方便确认，如果翻译了，保留一下原名在括号里（可选）
-                # if display_name != primary_name and not chinese_name:
-                #     display_name = f"{display_name} ({primary_name})"
-
-                # --- 2. 图片与年份 ---
-                thumb_node = item.find("thumbnail")
-                thumbnail = thumb_node.text if thumb_node is not None else ""
-
-                year_node = item.find("yearpublished")
-                year = year_node.get("value") if year_node is not None else "N/A"
-
-                # --- 3. 处理描述 (强制翻译) ---
-                desc_node = item.find("description")
-                description_cn = "暂无简介"
-
-                if desc_node is not None and desc_node.text:
-                    full_desc = unescape(desc_node.text).replace('<br/>', '\n')
-                    # 翻译简介 (耗时操作)
-                    try:
-                        # 截取前 500 字符翻译，不用全翻，为了速度
-                        description_cn = translator.translate(full_desc[:500])
-                    except:
-                        description_cn = full_desc[:500] # 失败返英文
-
-                # --- 4. 评分与排名 ---
-                stats_node = item.find("statistics")
+                # === 新增：统计数据 (含翻译简介、重度) ===
+                stats = item.find("statistics")
                 rating = 0.0
-                rank_val = "N/A"
-                if stats_node is not None:
-                    ratings = stats_node.find("ratings")
-                    if ratings is not None:
-                        avg_node = ratings.find("average")
-                        if avg_node is not None:
-                            try: rating = round(float(avg_node.get("value")), 1)
-                            except: pass
+                rank_str = "N/A"
+                weight = 0.0
+
+                if stats is not None:
+                    ratings = stats.find("ratings")
+                    if ratings:
+                        try: rating = round(float(ratings.find("average").get("value")), 1)
+                        except: pass
+                        try: weight = round(float(ratings.find("averageweight").get("value")), 2)
+                        except: pass
+
                         ranks = ratings.find("ranks")
-                        if ranks is not None:
+                        if ranks:
                             for rk in ranks.findall("rank"):
                                 if rk.get("name") == "boardgame":
                                     val = rk.get("value")
-                                    rank_val = f"No. {val}" if val.isdigit() else "Unranked"
-                                    break
+                                    rank_str = f"No. {val}" if val.isdigit() else "-"
+
+                # 简介翻译
+                desc_node = item.find("description")
+                desc_cn = "暂无简介"
+                if desc_node is not None and desc_node.text:
+                    full_desc = unescape(desc_node.text).replace('<br/>', '\n')
+                    try: desc_cn = translator.translate(full_desc[:1000])
+                    except: desc_cn = full_desc[:1000]
 
                 results.append({
                     "id": g_id,
-                    "name": display_name, # 这里存入的是中文名
+                    "name": display_name,
                     "year": year,
                     "thumbnail": thumbnail,
-                    "description": description_cn, # 这里存入的是中文简介
+                    "description": desc_cn,
                     "rating": rating,
-                    "rank": rank_val
+                    "rank": rank_str,
+                    "weight": weight,
+                    "min_players": min_p,
+                    "max_players": max_p
                 })
             except Exception as e:
-                print(f"Parse error: {e}")
                 continue
         return results
-
     except Exception as e:
-        print(f"API Error: {e}")
+        print(e)
         return []
 
 # ==========================================
-# 3. 移动端 UI 设计
+# 3. UI 逻辑 (支持库管理)
 # ==========================================
-
-st.set_page_config(page_title="桌游投票", page_icon="🎲", layout="centered")
+st.set_page_config(page_title="桌游助手", page_icon="🎲", layout="centered")
 init_db()
 
-# 状态管理
+# Session State
 if "user_nick" not in st.session_state: st.session_state.user_nick = ""
 if "admin_search_results" not in st.session_state: st.session_state.admin_search_results = []
 if "is_searching" not in st.session_state: st.session_state.is_searching = False
 
-# 辅助函数：格式化时间
-def format_poll_label(row):
-    # 将 SQLite 的时间字符串转换为更易读的格式（截取日期部分即可）
-    date_part = row['created_at'].split(' ')[0]
-    return f"{row['title']} ({date_part})"
-
-# 回调函数
 def trigger_search():
     query = st.session_state.admin_query
     if query:
@@ -309,198 +315,226 @@ def trigger_search():
         try:
             results = fetch_bgg_api(query)
             st.session_state.admin_search_results = results
-            if not results:
-                st.toast("无结果 (请检查网络或关键词)", icon="🐢")
-        except Exception as e:
-            st.toast(f"Error: {e}", icon="❌")
-        finally:
-            st.session_state.is_searching = False
+            if not results: st.toast("无结果", icon="🐢")
+        except: st.toast("网络错误", icon="❌")
+        finally: st.session_state.is_searching = False
 
-def admin_add_game_callback(poll_id, game):
-    add_candidate_to_db(poll_id, game)
-    st.toast(f"已添加: {game['name']}", icon="✅")
-
-def user_vote_callback(poll_id, candidate_id, nick):
+def vote_cb(poll_id, candidate_id, nick):
     if not nick:
-        st.toast("请填写昵称", icon="⚠️")
+        st.toast("请填昵称", icon="⚠️")
         return
-    success = cast_vote(poll_id, candidate_id, nick)
-    if success: st.toast("投票成功", icon="🎉")
-    else: st.toast("已投过该项", icon="✋")
+    if cast_vote(poll_id, candidate_id, nick): st.toast("成功", icon="🎉")
+    else: st.toast("已投过", icon="✋")
 
-# --- UI 结构 ---
-st.title("🎲 桌游投票站")
-tab1, tab2 = st.tabs(["🙋 参与投票", "🔧 发起与管理"])
+# --- UI START ---
+st.title("🎲 桌游投票站 2.0")
+tab1, tab2 = st.tabs(["🙋 参与投票", "🔒 管理员后台"])
 
-# Tab 1: 用户投票
+# ================= TAB 1: 用户投票 =================
 with tab1:
     polls = get_polls()
     if polls.empty:
-        st.info("暂无投票，请去隔壁创建一个！")
+        st.info("暂无正在进行的投票")
     else:
-        # 修改点 2：显示创建时间
-        poll_map = {row['id']: format_poll_label(row) for _, row in polls.iterrows()}
-
+        poll_map = {row['id']: f"{row['title']} ({row['created_at'][:10]})" for _, row in polls.iterrows()}
         with st.container(border=True):
-            selected_poll_id = st.selectbox(
-                "选择房间",
-                options=poll_map.keys(),
-                format_func=lambda x: poll_map[x]
-            )
-            user_nick = st.text_input("你的昵称 (必填)", value=st.session_state.user_nick, placeholder="是谁在投票？")
-            st.session_state.user_nick = user_nick
+            pid = st.selectbox("选择房间", options=poll_map.keys(), format_func=lambda x: poll_map[x])
+            nick = st.text_input("昵称", value=st.session_state.user_nick)
+            st.session_state.user_nick = nick
 
-        st.markdown("### 🏆 实时排名")
-        results = get_poll_results(selected_poll_id)
+        st.markdown("### 🏆 候选项")
+        results = get_poll_results(pid)
 
-        if not results:
-            st.info("等待管理员添加桌游...")
-        else:
-            for idx, cand in enumerate(results):
-                rank_icon = f"#{idx+1}"
-                if idx == 0: rank_icon = "🥇"
-                elif idx == 1: rank_icon = "🥈"
-                elif idx == 2: rank_icon = "🥉"
+        for idx, cand in enumerate(results):
+            rank_icon = ["🥇","🥈","🥉"][idx] if idx < 3 else f"#{idx+1}"
 
-                # 处理可能为空的旧数据字段
-                rating_display = cand.get('rating', 0.0) or 0.0
-                rank_display = cand.get('bgg_rank', 'N/A') or 'N/A'
-                desc_display = cand.get('description', '暂无简介') or '暂无简介'
+            with st.container(border=True):
+                # 顶部：名字 + 年份
+                st.markdown(f"**{rank_icon} {cand['name']}** <span style='color:grey'>({cand['year']})</span>", unsafe_allow_html=True)
 
-                with st.container(border=True):
-                    # 标题行：排名 + 名称 + 年份
-                    st.markdown(f"**{rank_icon} {cand['name']}** <span style='color:grey; font-size:0.8em'>({cand['year']})</span>", unsafe_allow_html=True)
+                c_img, c_info = st.columns([1, 2.5])
+                with c_img:
+                    if cand['thumbnail']: st.image(cand['thumbnail'], use_container_width=True)
+                    st.metric("票数", cand['count'])
 
-                    c_img, c_stat = st.columns([1, 2])
-                    with c_img:
-                        if cand['thumbnail']: st.image(cand['thumbnail'], use_container_width=True)
-                        else: st.write("🖼️")
+                with c_info:
+                    # 数据标签行
+                    c_tag1, c_tag2, c_tag3 = st.columns(3)
+                    c_tag4,c_tag5 = st.columns(2)
+                    c_tag1.caption(f"BGG评分⭐ {cand['rating']}")
+                    c_tag2.caption(f"BGG排名🏆 {cand['rank']}")
+                    # 新增展示：重度和人数
+                    c_tag3.caption(f"支持人数🏆  {cand['min_players']}-{cand['max_players']}人")
+                    c_tag4.caption(f"重度(范围1~5)🧠 {cand['weight']}")
+                    if cand['weight'] <= 2:
+                        c_tag5.caption(f"策略级别⚽️ 轻度")
+                    elif cand['weight'] <= 3:
+                        c_tag5.caption(f"策略级别⚽️ 中度")
+                    else:
+                        c_tag5.caption(f"策略级别⚽ 重度")
+                    # 简介
+                    desc = cand['description'] or "无简介"
+                    if len(desc) > 120:
+                        st.caption(f"📝 {desc[:120]}...")
+                        with st.expander("详情"): st.write(desc)
+                    else:
+                        st.caption(f"📝 {desc}")
 
-                        # 票数显示移到图片下方，更显眼
-                        st.metric("当前票数", cand['count'])
+                    st.write("")
+                    # 投票按钮
+                    has_voted = nick in cand['voters'] if nick else False
+                    if has_voted:
+                        st.button("✅ 已投", key=f"v_d_{cand['candidate_id']}", disabled=True, use_container_width=True)
+                    else:
+                        st.button("🗳️ 投一票", key=f"v_b_{cand['candidate_id']}", disabled=(not nick), type="primary", use_container_width=True,
+                                  on_click=vote_cb, args=(pid, cand['candidate_id'], nick))
 
-                    with c_stat:
-                        # 修改点 3：显示评分、排名和简介
-                        sub_c1, sub_c2 = st.columns(2)
-                        sub_c1.caption(f"⭐ BGG {rating_display}")
-                        sub_c2.caption(f"🏆 {rank_display}")
+                if cand['voters']:
+                    with st.expander(f"支持者 ({len(cand['voters'])})"):
+                        st.write(", ".join(cand['voters']))
 
-                        st.caption(f"📝 {desc_display}")
-
-                        st.write("") # Spacer
-
-                        has_voted = user_nick in cand['voters'] if user_nick else False
-                        if has_voted:
-                            st.button("✅ 已投", key=f"v_done_{cand['id']}", disabled=True, use_container_width=True)
-                        else:
-                            st.button(
-                                "🗳️ 投一票",
-                                key=f"v_btn_{cand['id']}",
-                                disabled=(not user_nick),
-                                type="primary",
-                                use_container_width=True,
-                                on_click=user_vote_callback,
-                                args=(selected_poll_id, cand['id'], user_nick)
-                            )
-
-                    if cand['voters']:
-                        with st.expander(f"支持者 ({len(cand['voters'])})"):
-                            st.write(", ".join(list(cand['voters'])))
-
-# Tab 2: 管理员后台
+# ================= TAB 2: 管理员后台 =================
 with tab2:
-    with st.expander("➕ 发起新投票", expanded=False):
-        new_title = st.text_input("主题名称", placeholder="例如: 周五桌游夜")
-        if st.button("创建", use_container_width=True):
-            if new_title:
-                create_poll(new_title)
-                st.success("创建成功")
-                time.sleep(0.5)
-                st.rerun()
-    st.markdown("---")
-    polls = get_polls()
-    if not polls.empty:
-        # 同样应用时间格式化
-        poll_map_admin = {row['id']: format_poll_label(row) for _, row in polls.iterrows()}
-        manage_pid = st.selectbox("管理哪个房间？", options=poll_map_admin.keys(), format_func=lambda x: poll_map_admin[x])
+    admin_tab1, admin_tab2 = st.tabs(["📚 游戏库管理", "🚀 发起新投票"])
 
-        with st.popover("❌ 删除此房间"):
-            if st.button("确认删除", type="primary", use_container_width=True):
-                delete_poll(manage_pid)
-                st.rerun()
+    # --- SubTab 1: 游戏库 (录入) ---
+    with admin_tab1:
+        st.info("先在这里搜索并添加游戏，然后在隔壁发起投票。")
 
-        st.markdown("#### 🔍 搜索添加")
-
-        # 修改点 1：恢复输入框
+        # 1. 搜索与添加
         with st.form(key="search_form", border=False):
-            col_search_input, col_search_btn = st.columns([3, 1])
+            # vertical_alignment="bottom" 是关键，让输入框底部和按钮底部对齐
+            c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
 
-            with col_search_input:
-                # 这里的 key="admin_query" 会自动绑定到 session_state
-                st.text_input(
-                    "输入桌游名",
-                    key="admin_query",
-                    placeholder="例如: 展翅翱翔, 卡坦岛...",
-                    label_visibility="collapsed"
-                )
+            with c1:
+                # 加一个 label 哪怕是空的，也能占位保证对齐更标准
+                st.text_input("BGG 搜游戏", key="admin_query", placeholder="例如: 展翅翱翔, 搜不到使用英文或繁体试试")
 
-            with col_search_btn:
-                # 注意：在 form 内部必须使用 form_submit_button
-                submitted = st.form_submit_button("🔎 搜", use_container_width=True, type="primary")
-
-            if submitted:
-                with st.spinner("正在请求 BGG ..."):
-                    trigger_search()
+            with c2:
+                # 提交按钮
+                if st.form_submit_button("🔎 搜", type="primary", use_container_width=True):
+                    with st.spinner("查找中..."):
+                        trigger_search()
 
         if st.session_state.admin_search_results:
-            st.caption(f"找到 {len(st.session_state.admin_search_results)} 个结果")
+            st.write(f"找到 {len(st.session_state.admin_search_results)} 个结果:")
+            # 使用横向滚动展示搜索结果，节省空间
             for game in st.session_state.admin_search_results:
                 with st.container(border=True):
-                    c1, c2, c3 = st.columns([1, 3, 1])
-                    with c1:
-                        if game['thumbnail']: st.image(game['thumbnail'], use_container_width=True)
-                    with c2:
-                        # 搜索结果也展示详细信息，方便确认
-                        st.markdown(f"**{game['name']}** ({game['year']})")
-                        st.caption(f"⭐ {game['rating']} | 🏆 {game['rank']}")
-                        st.caption(game['description'][:120] + "...")
-                    with c3:
-                        st.button("➕", key=f"add_{game['id']}", on_click=admin_add_game_callback, args=(manage_pid, game), use_container_width=True)
+                    ac1, ac2, ac3 = st.columns([1, 4, 1])
+                    with ac1:
+                        if game['thumbnail']: st.image(game['thumbnail'], width=60)
+                    with ac2:
+                        st.write(f"**{game['name']}** ({game['year']})")
+                        st.caption(f"👥 {game['min_players']}-{game['max_players']}人 | 🧠 {game['weight']} | ⭐ {game['rating']}")
+                    with ac3:
+                        if st.button("➕ 入库", key=f"add_lib_{game['id']}", use_container_width=True):
+                            if add_game_to_library(game):
+                                st.toast(f"已存入: {game['name']}", icon="✅")
 
-        st.markdown("#### 📋 已添加桌游")
-        curr_games = get_poll_results(manage_pid)
-        for cg in curr_games:
-            with st.container(border=True):
-                col_a, col_b = st.columns([4, 1])
-                with col_a:
-                    st.write(f"**{cg['name']}**")
-                with col_b:
-                    if st.button("🗑️", key=f"del_{cg['id']}"):
-                        delete_candidate(cg['id'])
-                        st.rerun()
-    else:
-        st.info("请先创建投票。")
+        st.divider()
+        st.markdown("#### 📂 当前游戏库")
+
+        # 2. 库内游戏管理 (表格展示)
+        lib_df = get_library_df()
+        if not lib_df.empty:
+            # 简单展示表格
+            st.dataframe(
+                lib_df[['id', 'name', 'rating', 'weight', 'min_players', 'max_players']],
+                hide_index=True,
+                use_container_width=True
+            )
+
+            # 删除功能
+            with st.expander("🗑️ 删除库中游戏"):
+                del_id = st.selectbox("选择要删除的游戏", options=lib_df['id'], format_func=lambda x: lib_df[lib_df['id']==x]['name'].values[0])
+                if st.button("确认删除 (会连带删除相关投票)", type="primary"):
+                    delete_from_library(del_id)
+                    st.rerun()
+        else:
+            st.write("库里还是空的，快去搜索添加吧。")
+
+    # --- SubTab 2: 发起投票 (批量选择) ---
+    with admin_tab2:
+        st.markdown("#### 1. 设置主题")
+        new_poll_title = st.text_input("投票标题", placeholder="例如: 周五重策局选哪个？")
+
+        st.markdown("#### 2. 勾选游戏")
+
+        lib_df = get_library_df()
+        if lib_df.empty:
+            st.warning("请先去“游戏库管理”添加游戏！")
+        else:
+            # === 修改处 2：全选/全不选逻辑 ===
+
+            # 初始化状态控制变量
+            if "select_mode" not in st.session_state: st.session_state.select_mode = False # 默认不选
+            if "editor_key_seed" not in st.session_state: st.session_state.editor_key_seed = 0 # 用于强制重绘的种子
+
+            # 功能按钮区
+            col_btn1, col_btn2, col_space = st.columns([1, 1, 4])
+            with col_btn1:
+                if st.button("✅ 全选", use_container_width=True):
+                    st.session_state.select_mode = True
+                    st.session_state.editor_key_seed += 1 # 改变 key，强制下方表格刷新
+                    st.rerun()
+            with col_btn2:
+                if st.button("⬜ 清空", use_container_width=True):
+                    st.session_state.select_mode = False
+                    st.session_state.editor_key_seed += 1
+                    st.rerun()
+
+            # 准备数据：根据状态设置“选择”列的默认值
+            select_df = lib_df[['id', 'name', 'rating', 'weight', 'min_players', 'max_players']].copy()
+            # 将 select_mode (True/False) 赋值给所有行
+            select_df.insert(0, "选择", st.session_state.select_mode)
+
+            # 渲染表格
+            # key 必须包含 seed，这样点击按钮后组件会被完全重建，从而应用新的默认值
+            edited_df = st.data_editor(
+                select_df,
+                column_config={
+                    "选择": st.column_config.CheckboxColumn(required=True),
+                    "id": None,
+                    "name": "游戏名称",
+                    "rating": "评分",
+                    "weight": "重度",
+                    "min_players": "Min",
+                    "max_players": "Max"
+                },
+                disabled=["id", "name", "rating", "weight", "min_players", "max_players"],
+                hide_index=True,
+                use_container_width=True,
+                key=f"game_selector_{st.session_state.editor_key_seed}"
+            )
+
+            # 获取最终勾选的 ID
+            selected_ids = edited_df[edited_df["选择"] == True]['id'].tolist()
+
+            st.markdown("#### 3. 创建")
+            btn_col1, btn_col2 = st.columns([1, 1], vertical_alignment="bottom")
+            with btn_col1:
+                st.caption(f"已选 {len(selected_ids)} 个游戏")
+            with btn_col2:
+                if st.button("🚀 发起投票", type="primary", use_container_width=True, disabled=len(selected_ids)==0):
+                    if not new_poll_title:
+                        st.toast("标题不能为空", icon="⚠️")
+                    else:
+                        create_poll_with_games(new_poll_title, selected_ids)
+                        st.success("创建成功！可前往“参与投票”页查看。")
+                        time.sleep(1)
+
+        st.divider()
+        with st.popover("🗑️ 删除旧投票房间"):
+            all_polls = get_polls()
+            if not all_polls.empty:
+                del_pid = st.selectbox("选择要删除的房间", options=all_polls['id'], format_func=lambda x: all_polls[all_polls['id']==x]['title'].values[0])
+                if st.button("确认销毁"):
+                    delete_poll(del_pid)
+                    st.rerun()
+            else:
+                st.write("没有房间。")
 
 # --- Footer ---
 st.markdown("---")
-# st.caption("Data provided by **BoardGameGeek XML API 2**. This is a non-commercial fan project.")
-# st.caption("Review terms at: https://boardgamegeek.com/using_the_xml_api")
-
-image_path = "images/powered-bgg.webp"
-# 检查文件是否存在
-if not os.path.exists(image_path):
-    st.error(f"找不到文件: {image_path}")
-else:
-    # 2. 读取文件并转码
-    with open(image_path, "rb") as f:
-        img_data = f.read()
-        b64_data = base64.b64encode(img_data).decode()
-        # 自动判断 MIME 类型 (这里假定是 webp，如果是 png 改成 image/png)
-        mime_type = "image/webp"
-
-    # 3. 嵌入 HTML
-    st.html(f"""
-    <a href="https://boardgamegeek.com/">
-      <img src="data:{mime_type};base64,{b64_data}" width="160" alt="Powered by BGG">
-    </a>
-    """)
+# Image logic...
