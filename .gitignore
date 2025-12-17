@@ -10,4 +10,3 @@ logs/
 .vscode/
 tmp/
 .streamlit/secrets.toml
-*.db
