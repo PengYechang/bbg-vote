@@ -330,6 +330,17 @@ def vote_cb(poll_id, candidate_id, nick):
 st.title("🎲 桌游投票站 2.0")
 tab1, tab2 = st.tabs(["🙋 参与投票", "🔒 管理员后台"])
 
+# 1. 定义一个检查包装函数
+def check_and_vote(p_id, c_id, user_nick):
+    # 如果没有昵称，弹出提示
+    if not user_nick or not user_nick.strip():
+        # st.toast 会在右上角弹出一个会自动消失的消息框
+        st.toast("⚠️ 请先在上方输入您的昵称才能投票！", icon="🚫")
+        return
+
+    # 如果有昵称，则调用原本的投票逻辑
+    vote_cb(p_id, c_id, user_nick)
+
 # ================= TAB 1: 用户投票 =================
 with tab1:
     polls = get_polls()
@@ -383,11 +394,22 @@ with tab1:
                     st.write("")
                     # 投票按钮
                     has_voted = nick in cand['voters'] if nick else False
+
                     if has_voted:
                         st.button("✅ 已投", key=f"v_d_{cand['candidate_id']}", disabled=True, use_container_width=True)
                     else:
-                        st.button("🗳️ 投一票", key=f"v_b_{cand['candidate_id']}", disabled=(not nick), type="primary", use_container_width=True,
-                                  on_click=vote_cb, args=(pid, cand['candidate_id'], nick))
+                        # 这里的变化有两点：
+                        # 1. disabled 改为 False (或者直接删掉 disabled 参数，默认为 False)
+                        # 2. on_click 指向上面定义的 check_and_vote
+                        st.button(
+                            "🗳️ 投一票",
+                            key=f"v_b_{cand['candidate_id']}",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=False,  # <--- 关键：让按钮始终可点
+                            on_click=check_and_vote,  # <--- 关键：先经由检查函数
+                            args=(pid, cand['candidate_id'], nick)
+                        )
 
                 if cand['voters']:
                     with st.expander(f"支持者 ({len(cand['voters'])})"):
